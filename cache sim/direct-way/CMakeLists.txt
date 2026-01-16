@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.10)
+project(direct-cache)
+set(CMAKE_CXX_STANDARD 17)
+include_directories(include)
+add_executable(test_cache "c++/test_direct_mapped.cpp" "c++/direct_mapped_cache.cpp")

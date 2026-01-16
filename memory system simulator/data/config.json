@@ -1,0 +1,14 @@
+{
+    "l1_cache": {
+        "size_kb": 32,
+        "block_size": 64,
+        "associativity": 8
+    },
+    "dram": {
+        "banks": 16,
+        "tRCD": 14,
+        "tCAS": 14,
+        "tRP": 14,
+        "tRAS": 38
+    }
+}

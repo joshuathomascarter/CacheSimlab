@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.10)
+project(4way-cache)
+set(CMAKE_CXX_STANDARD 17)
+include_directories(include)
+add_executable(test_cache "tests c++/test_set_associative.cpp" "c++/set_associative_cache.cpp")

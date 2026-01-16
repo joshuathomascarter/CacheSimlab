@@ -1,0 +1,250 @@
+#include "../include/direct_mapped_cache.h"
+#include <cassert>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <vector>
+
+using namespace memsim;
+
+/**
+ * Test 1: Sequential Access Pattern
+ *
+ * Tests cache behavior with sequential memory accesses.
+ * Expected: High hit rate after warmup if working set fits in cache.
+ */
+void test_sequential_access() {
+  std::cout << "\n=== Test 1: Sequential Access Pattern ===\n";
+
+  // Create a small cache: 4KB, 64-byte blocks
+  CacheConfig config(4, 64, 1); // 4KB / 64B = 64 lines
+  DirectMappedCache cache(config);
+
+  cache.print_config(std::cout);
+  std::cout << "\n";
+
+  // Test parameters
+  const uint32_t block_size = 64;
+  const uint32_t num_blocks = 64; // Exactly fills the cache
+  const uint32_t num_passes = 3;
+
+  std::cout << "Accessing " << num_blocks << " sequential blocks, "
+            << num_passes << " passes\n";
+
+  // First pass: All misses (cold start)
+  std::cout << "\nPass 1 (cold start):\n";
+  for (uint32_t i = 0; i < num_blocks; ++i) {
+    Address addr = i * block_size;
+    AccessResult result = cache.access(addr, AccessType::READ);
+
+    // First access should always miss
+    if (i < 5) { // Print first few
+      std::cout << "  Access 0x" << std::hex << addr << std::dec << ": "
+                << (result.hit ? "HIT" : "MISS")
+                << " (latency: " << result.latency << ")\n";
+    }
+  }
+
+  // Second pass: Should be all hits (data is cached)
+  std::cout << "\nPass 2 (should hit):\n";
+  for (uint32_t i = 0; i < num_blocks; ++i) {
+    Address addr = i * block_size;
+    AccessResult result = cache.access(addr, AccessType::READ);
+
+    // Should hit now
+    if (i < 5) { // Print first few
+      std::cout << "  Access 0x" << std::hex << addr << std::dec << ": "
+                << (result.hit ? "HIT" : "MISS")
+                << " (latency: " << result.latency << ")\n";
+    }
+
+    assert(result.hit && "Sequential access should hit after warmup");
+  }
+
+  // Print statistics
+  std::cout << "\nFinal Statistics:\n";
+  cache.get_stats().print_summary(std::cout);
+
+  std::cout << "\n✓ Sequential access test passed!\n";
+}
+
+/**
+ * Test 2: Random Access Pattern
+ *
+ * Tests cache behavior with random memory accesses.
+ * Expected: Low hit rate due to poor locality.
+ */
+void test_random_access() {
+  std::cout << "\n=== Test 2: Random Access Pattern ===\n";
+
+  // Create cache: 8KB, 64-byte blocks
+  CacheConfig config(8, 64, 1); // 8KB / 64B = 128 lines
+  DirectMappedCache cache(config);
+
+  cache.print_config(std::cout);
+  std::cout << "\n";
+
+  // Random number generator
+  std::mt19937 rng(42); // Fixed seed for reproducibility
+  std::uniform_int_distribution<Address> dist(0, 1024 * 1024); // 1MB range
+
+  const uint32_t num_accesses = 1000;
+  std::cout << "Performing " << num_accesses << " random accesses\n";
+
+  uint32_t hit_count = 0;
+  for (uint32_t i = 0; i < num_accesses; ++i) {
+    Address addr = dist(rng);
+    AccessResult result = cache.access(addr, AccessType::READ);
+
+    if (result.hit) {
+      hit_count++;
+    }
+
+    // Print first few
+    if (i < 5) {
+      std::cout << "  Access " << i << " @ 0x" << std::hex << addr << std::dec
+                << ": " << (result.hit ? "HIT" : "MISS") << "\n";
+    }
+  }
+
+  double hit_rate = (double)hit_count / num_accesses;
+  std::cout << "\nHit rate: " << std::fixed << std::setprecision(2)
+            << (hit_rate * 100) << "%\n";
+
+  // Print statistics
+  std::cout << "\nFinal Statistics:\n";
+  cache.get_stats().print_summary(std::cout);
+
+  // Random access should have low hit rate
+  assert(hit_rate < 0.5 && "Random access should have low hit rate");
+
+  std::cout << "\n✓ Random access test passed!\n";
+}
+
+/**
+ * Test 3: Write-Back on Eviction
+ *
+ * Tests that dirty cache lines are properly written back on eviction.
+ */
+void test_writeback() {
+  std::cout << "\n=== Test 3: Write-Back on Eviction ===\n";
+
+  // Create a tiny cache: 1KB, 64-byte blocks = 16 lines
+  CacheConfig config(1, 64, 1);
+  DirectMappedCache cache(config);
+
+  cache.print_config(std::cout);
+  std::cout << "\n";
+
+  const uint32_t block_size = 64;
+
+  // Step 1: Write to address 0 (will be a miss, loads into cache, sets dirty)
+  std::cout << "Step 1: Write to address 0x0\n";
+  Address addr_a = 0x0;
+  AccessResult result1 = cache.access(addr_a, AccessType::WRITE);
+  std::cout << "  Result: " << (result1.hit ? "HIT" : "MISS")
+            << " (expected MISS)\n";
+  assert(!result1.hit && "First write should miss");
+
+  // Step 2: Read from same address (should hit)
+  std::cout << "\nStep 2: Read from address 0x0\n";
+  AccessResult result2 = cache.access(addr_a, AccessType::READ);
+  std::cout << "  Result: " << (result2.hit ? "HIT" : "MISS")
+            << " (expected HIT)\n";
+  assert(result2.hit && "Read after write should hit");
+
+  // Step 3: Access enough addresses to evict the first line
+  // In direct-mapped cache, addresses that map to the same index will evict
+  // each other Address 0x0 maps to index 0 Address 0x400 (1KB) also maps to
+  // index 0 (wraps around)
+  std::cout << "\nStep 3: Access address 0x400 (will evict 0x0)\n";
+  Address addr_b = 0x400; // Maps to same index as 0x0
+  AccessResult result3 = cache.access(addr_b, AccessType::READ);
+  std::cout << "  Result: " << (result3.hit ? "HIT" : "MISS")
+            << " (expected MISS, evicts 0x0)\n";
+  assert(!result3.hit && "Conflicting address should miss");
+
+  // Step 4: Access original address again (should miss, was evicted)
+  std::cout << "\nStep 4: Access address 0x0 again (was evicted)\n";
+  AccessResult result4 = cache.access(addr_a, AccessType::READ);
+  std::cout << "  Result: " << (result4.hit ? "HIT" : "MISS")
+            << " (expected MISS, was evicted)\n";
+  assert(!result4.hit && "Evicted address should miss");
+
+  // Print statistics
+  std::cout << "\nFinal Statistics:\n";
+  cache.get_stats().print_summary(std::cout);
+
+  std::cout << "\n✓ Write-back test passed!\n";
+}
+
+/**
+ * Test 4: Conflict Misses
+ *
+ * Tests that addresses mapping to the same index cause conflict misses.
+ */
+void test_conflict_misses() {
+  std::cout << "\n=== Test 4: Conflict Misses ===\n";
+
+  // Create cache: 2KB, 64-byte blocks = 32 lines
+  CacheConfig config(2, 64, 1);
+  DirectMappedCache cache(config);
+
+  cache.print_config(std::cout);
+  std::cout << "\n";
+
+  // Two addresses that map to the same cache line
+  Address addr1 = 0x0000;
+  Address addr2 = 0x0800; // 2KB offset, maps to same index
+
+  std::cout << "Testing conflict between 0x" << std::hex << addr1 << " and 0x"
+            << addr2 << std::dec << "\n\n";
+
+  // Access addr1 (miss)
+  std::cout << "Access addr1: ";
+  AccessResult r1 = cache.access(addr1, AccessType::READ);
+  std::cout << (r1.hit ? "HIT" : "MISS") << "\n";
+  assert(!r1.hit);
+
+  // Access addr1 again (hit)
+  std::cout << "Access addr1 again: ";
+  AccessResult r2 = cache.access(addr1, AccessType::READ);
+  std::cout << (r2.hit ? "HIT" : "MISS") << "\n";
+  assert(r2.hit);
+
+  // Access addr2 (miss, evicts addr1)
+  std::cout << "Access addr2 (conflicts with addr1): ";
+  AccessResult r3 = cache.access(addr2, AccessType::READ);
+  std::cout << (r3.hit ? "HIT" : "MISS") << "\n";
+  assert(!r3.hit);
+
+  // Access addr1 again (miss, was evicted)
+  std::cout << "Access addr1 again (was evicted): ";
+  AccessResult r4 = cache.access(addr1, AccessType::READ);
+  std::cout << (r4.hit ? "HIT" : "MISS") << "\n";
+  assert(!r4.hit);
+
+  std::cout << "\n✓ Conflict miss test passed!\n";
+}
+
+int main() {
+  std::cout << "======================================\n";
+  std::cout << "Direct-Mapped Cache Simulator Tests\n";
+  std::cout << "======================================\n";
+
+  try {
+    test_sequential_access();
+    test_random_access();
+    test_writeback();
+    test_conflict_misses();
+
+    std::cout << "\n======================================\n";
+    std::cout << "✓ All tests passed!\n";
+    std::cout << "======================================\n";
+
+    return 0;
+  } catch (const std::exception &e) {
+    std::cerr << "\n✗ Test failed with exception: " << e.what() << "\n";
+    return 1;
+  }
+}
