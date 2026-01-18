@@ -1,0 +1,37 @@
+CACHE VALIDATION REPORT
+================================================================================
+
+❌ VALIDATION FAILED
+
+Summary:
+  Expected hits:   1
+  Actual hits:     1
+  Expected misses: 14
+  Actual misses:   14
+  Expected rate:   6.67%
+  Actual rate:     6.67%
+
+Mismatches (1):
+--------------------------------------------------------------------------------
+  1. Access count mismatch: expected 15 accesses, got 0
+
+Detailed Comparison:
+--------------------------------------------------------------------------------
+#   Expected     Actual       Match 
+--------------------------------------------------------------------------------
+1   MISS         N/A          ❌     
+2   MISS         N/A          ❌     
+3   MISS         N/A          ❌     
+4   MISS         N/A          ❌     
+5   HIT          N/A          ❌     
+6   MISS         N/A          ❌     
+7   MISS         N/A          ❌     
+8   MISS         N/A          ❌     
+9   MISS         N/A          ❌     
+10  MISS         N/A          ❌     
+11  MISS         N/A          ❌     
+12  MISS         N/A          ❌     
+13  MISS         N/A          ❌     
+14  MISS         N/A          ❌     
+15  MISS         N/A          ❌     
+================================================================================
