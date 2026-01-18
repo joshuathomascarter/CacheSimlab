@@ -1,38 +1,84 @@
 #include "eviction_policies.hpp"
-#include <random>
-#include <algorithm>
-#include <stdexcept>
 #include <cassert>
 
 // ============================================================================
-// LRU Implementation
+// LRU Implementation (Linked List)
 // ============================================================================
 
-LRU::LRU(int num_ways) : EvictionPolicy(num_ways), clock(0) {
-    counters.resize(num_ways, 0);
+LRU::LRU(int num_ways) : EvictionPolicy(num_ways) {
+    // Create dummy nodes
+    head = new Node(-1);
+    tail = new Node(-1);
+    head->next = tail;
+    tail->prev = head;
+    
+    // Create a node for each way
+    way_nodes.resize(num_ways);
+    for (int i = 0; i < num_ways; i++) {
+        way_nodes[i] = nullptr;  // Not inserted yet
+    }
+}
+
+LRU::~LRU() {
+    // Delete all nodes
+    Node* current = head;
+    while (current != nullptr) {
+        Node* next = current->next;
+        delete current;
+        current = next;
+    }
 }
 
 void LRU::access(int way) {
-    counters[way] = clock;
-    clock ++;
+    if (way_nodes[way] == nullptr) {
+        // First access: create node and add to front
+        Node* new_node = new Node(way);
+        way_nodes[way] = new_node;
+        add_to_front(new_node);
+    } else {
+        // Re-access: move to front
+        remove_node(way_nodes[way]);
+        add_to_front(way_nodes[way]);
+    }
 }
 
 int LRU::get_victim() {
-    int victim = 0;
-    for (int i = 1; i < num_ways; ++i) {
-        if (counters[i] < counters[victim]) {
-            victim = i;
-        }
-        }
-        return victim;
-    }
+    // Victim is the node just before dummy_tail (least recently used)
+    Node* victim_node = tail->prev;
+    return victim_node->way;
+}
 
 void LRU::reset() {
-    for (int i = 0; i < num_ways; ++i) {
-        counters[i] = 0;
+    // Delete all real nodes
+    Node* current = head->next;
+    while (current != tail) {
+        Node* next = current->next;
+        delete current;
+        current = next;
     }
+    
+    // Reset list to just dummy nodes
+    head->next = tail;
+    tail->prev = head;
+    
+    // Reset way_nodes
+    for (int i = 0; i < num_ways; i++) {
+        way_nodes[i] = nullptr;
+    }
+}
 
-    clock = 0;
+void LRU::remove_node(Node* node) {
+    // Unlink node from list
+    node->prev->next = node->next;
+    node->next->prev = node->prev;
+}
+
+void LRU::add_to_front(Node* node) {
+    // Insert node right after dummy_head
+    node->next = head->next;
+    node->prev = head;
+    head->next->prev = node;
+    head->next = node;
 }
 
 // ============================================================================

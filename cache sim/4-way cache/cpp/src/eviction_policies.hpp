@@ -37,21 +37,37 @@ protected:
 };
 
 // ============================================================================
-// LRU - Least Recently Used (Counter-based)
+// Node for Linked List
+// ============================================================================
+
+struct Node {
+    int way;
+    Node* next;
+    Node* prev;
+    
+    Node(int w = -1) : way(w), next(nullptr), prev(nullptr) {}
+};
+
+// ============================================================================
+// LRU - Least Recently Used (Linked List Implementation)
 // ============================================================================
 
 class LRU : public EvictionPolicy {
 public:
     explicit LRU(int num_ways);
-    ~LRU() = default;
+    ~LRU();
     
     void access(int way) override;
     int get_victim() override;
     void reset() override;
     
 private:
-    std::vector<uint32_t> counters;
-    uint32_t clock;
+    Node* head;              // Fake head node
+    Node* tail;              // Fake tail node
+    std::vector<Node*> way_nodes;  // Quick lookup: way → node
+    
+    void remove_node(Node* node);  // Remove node from list
+    void add_to_front(Node* node); // Add node to front
 };
 
 // ============================================================================
