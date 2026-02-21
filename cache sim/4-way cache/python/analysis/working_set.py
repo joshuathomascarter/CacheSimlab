@@ -5,7 +5,6 @@ Working Set Analysis
 Analyzes the working set of a memory trace - the set of unique addresses
 accessed within a time window. Useful for understanding cache size requirements.
 """
-
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import deque
@@ -143,23 +142,23 @@ def simulate_cache_hit_rate(trace: List[int], cache_blocks: int,
     """
     block_trace = [addr // block_size for addr in trace]
     
-    cache = []  # List acting as LRU stack (front = MRU, back = LRU)
+    if not trace:  # More Pythonic than "if trace"
+        return 0.0
+    
+    cache = []
     hits = 0
     
     for block in block_trace:
         if block in cache:
             hits += 1
-            # Move to front (MRU)
             cache.remove(block)
             cache.insert(0, block)
         else:
-            # Insert at front
             cache.insert(0, block)
-            # Evict if over capacity
             if len(cache) > cache_blocks:
                 cache.pop()
     
-    return hits / len(trace) if trace else 0.0
+    return hits / len(trace)  # Either len(trace) or len(block_trace) works!
 
 
 def estimate_cache_size_needed(trace: List[int], target_hit_rate: float,

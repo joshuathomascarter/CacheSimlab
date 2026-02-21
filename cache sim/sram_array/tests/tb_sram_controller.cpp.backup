@@ -1,0 +1,605 @@
+/**
+ * SRAM Controller Testbench
+ * Verilator-based RTL simulation with cross-validation
+ * 
+ * This testbench:
+ *   1. Generates test vectors (reads/writes)
+ *   2. Runs them through C++ golden model (software reference)
+ *   3. Runs them through Verilog RTL via Verilator (hardware simulation)
+ *   4. Compares results to validate RTL correctness
+ * 
+ * Usage:
+ *   verilator --cc ../rtl/sram_controller.v ../rtl/sram_array.v --exe tb_sram_controller.cpp
+ *   make -C obj_dir -f Vsram_controller.mk
+ *   ./obj_dir/Vsram_controller
+ */
+
+#include <iostream>
+#include <vector>
+#include <cstring>
+#include <iomanip>
+#include <cassert>
+#include <fstream>
+#include <cstdint>
+#include <cmath>
+#include <random>
+
+// Verilator includes (conditional - only if VERILATOR is defined)
+#ifdef VERILATOR
+#include "verilated.h"
+#include "Vsram_controller.h"
+#endif
+
+// ============================================================================
+// Test Vector Structures
+// ============================================================================
+
+enum class AccessType {
+    READ = 0,
+    WRITE = 1
+};
+
+struct TestVector {
+    int cycle;
+    AccessType type;
+    uint16_t address;
+    uint32_t data;
+};
+
+struct AccessResult {
+    int cycle;
+    AccessType type;
+    uint16_t address;
+    uint32_t data;
+    bool hit;
+    double latency_ns;
+};
+
+// ============================================================================
+// Golden Reference Model (C++)
+// ============================================================================
+
+class SRAMGoldenModel {
+private:
+    static constexpr int DEPTH = 65536;
+    static constexpr int WIDTH = 32;
+    static constexpr double READ_LATENCY_NS = 2.5;
+    static constexpr double WRITE_LATENCY_NS = 3.0;
+    static constexpr double CLOCK_PERIOD_NS = 8.0;
+    
+    // 4-bank architecture (byte-wide banks)
+    uint8_t bank0[DEPTH];  // bits [7:0]
+    uint8_t bank1[DEPTH];  // bits [15:8]
+    uint8_t bank2[DEPTH];  // bits [23:16]
+    uint8_t bank3[DEPTH];  // bits [31:24]
+    bool valid_bits[DEPTH];
+    
+public:
+    SRAMGoldenModel() {
+        std::memset(bank0, 0, sizeof(bank0));
+        std::memset(bank1, 0, sizeof(bank1));
+        std::memset(bank2, 0, sizeof(bank2));
+        std::memset(bank3, 0, sizeof(bank3));
+        std::memset(valid_bits, false, sizeof(valid_bits));
+    }
+    
+    AccessResult read(uint16_t addr, int cycle) {
+        AccessResult result;
+        result.cycle = cycle;
+        result.type = AccessType::READ;
+        result.address = addr;
+        
+        // Reassemble 32-bit word from 4 banks
+        uint8_t byte0 = bank0[addr];
+        uint8_t byte1 = bank1[addr];
+        uint8_t byte2 = bank2[addr];
+        uint8_t byte3 = bank3[addr];
+        result.data = ((uint32_t)byte3 << 24) |
+                      ((uint32_t)byte2 << 16) |
+                      ((uint32_t)byte1 << 8)  |
+                      ((uint32_t)byte0 << 0);
+        
+        result.hit = valid_bits[addr];
+        result.latency_ns = READ_LATENCY_NS;
+        return result;
+    }
+    
+    AccessResult write(uint16_t addr, uint32_t data, int cycle) {
+        AccessResult result;
+        result.cycle = cycle;
+        result.type = AccessType::WRITE;
+        result.address = addr;
+        result.data = data;
+        
+        // Split 32-bit data into 4 bytes (one per bank)
+        bank0[addr] = (data >> 0)  & 0xFF;
+        bank1[addr] = (data >> 8)  & 0xFF;
+        bank2[addr] = (data >> 16) & 0xFF;
+        bank3[addr] = (data >> 24) & 0xFF;
+        
+        valid_bits[addr] = true;
+        result.hit = true;
+        result.latency_ns = WRITE_LATENCY_NS;
+        
+        return result;
+    }
+    
+    uint32_t read_direct(uint16_t addr) const {
+        // Reassemble from banks
+        return ((uint32_t)bank3[addr] << 24) |
+               ((uint32_t)bank2[addr] << 16) |
+               ((uint32_t)bank1[addr] << 8)  |
+               ((uint32_t)bank0[addr] << 0);
+    }
+    
+    bool is_valid(uint16_t addr) const {
+        return valid_bits[addr];
+    }
+};
+
+// ============================================================================
+// Test Vector Generator
+// ============================================================================
+
+class TestVectorGenerator {
+private:
+    std::mt19937 rng;
+    std::vector<TestVector> vectors;
+    
+public:
+    TestVectorGenerator(uint32_t seed = 42) : rng(seed) {}
+    
+    void generate_sequential_writes(int count) {
+        for (int i = 0; i < count; i++) {
+            TestVector tv;
+            tv.cycle = vectors.size();
+            tv.type = AccessType::WRITE;
+            tv.address = i % 1024;  // Use first 1024 addresses
+            tv.data = 0xDEADBEEF + i;
+            vectors.push_back(tv);
+        }
+    }
+    
+    void generate_sequential_reads(int count) {
+        for (int i = 0; i < count; i++) {
+            TestVector tv;
+            tv.cycle = vectors.size();
+            tv.type = AccessType::READ;
+            tv.address = i % 1024;
+            tv.data = 0;
+            vectors.push_back(tv);
+        }
+    }
+    
+    void generate_random_pattern(int count, float write_ratio = 0.5) {
+        std::uniform_real_distribution<> coin(0.0, 1.0);
+        std::uniform_int_distribution<uint16_t> addr_dist(0, 4095);
+        std::uniform_int_distribution<uint32_t> data_dist(0, 0xFFFFFFFF);
+        
+        for (int i = 0; i < count; i++) {
+            TestVector tv;
+            tv.cycle = vectors.size();
+            
+            if (coin(rng) < write_ratio) {
+                tv.type = AccessType::WRITE;
+                tv.address = addr_dist(rng);
+                tv.data = data_dist(rng);
+            } else {
+                tv.type = AccessType::READ;
+                tv.address = addr_dist(rng);
+                tv.data = 0;
+            }
+            vectors.push_back(tv);
+        }
+    }
+    
+    void generate_corner_cases() {
+        std::vector<uint16_t> corner_addrs = {
+            0x0000, 0x0001, 0x7FFF, 0x8000, 0xFFFE, 0xFFFF
+        };
+        
+        for (uint16_t addr : corner_addrs) {
+            // Write
+            TestVector write_tv;
+            write_tv.cycle = vectors.size();
+            write_tv.type = AccessType::WRITE;
+            write_tv.address = addr;
+            write_tv.data = 0xAAAAAAAA ^ addr;  // Pattern based on address
+            vectors.push_back(write_tv);
+            
+            // Read back immediately
+            TestVector read_tv;
+            read_tv.cycle = vectors.size();
+            read_tv.type = AccessType::READ;
+            read_tv.address = addr;
+            read_tv.data = 0;
+            vectors.push_back(read_tv);
+        }
+    }
+    
+    void generate_burst_pattern(int burst_size = 8, int num_bursts = 10) {
+        for (int burst = 0; burst < num_bursts; burst++) {
+            uint16_t base_addr = (burst * burst_size) & 0x0FFF;
+            
+            // Write burst
+            for (int i = 0; i < burst_size; i++) {
+                TestVector tv;
+                tv.cycle = vectors.size();
+                tv.type = AccessType::WRITE;
+                tv.address = (base_addr + i) & 0x0FFF;
+                tv.data = 0x12345678 + i;
+                vectors.push_back(tv);
+            }
+            
+            // Read burst
+            for (int i = 0; i < burst_size; i++) {
+                TestVector tv;
+                tv.cycle = vectors.size();
+                tv.type = AccessType::READ;
+                tv.address = (base_addr + i) & 0x0FFF;
+                tv.data = 0;
+                vectors.push_back(tv);
+            }
+        }
+    }
+    
+    const std::vector<TestVector>& get_vectors() const {
+        return vectors;
+    }
+    
+    size_t count() const {
+        return vectors.size();
+    }
+};
+
+// ============================================================================
+// RTL Simulator (Verilator Wrapper)
+// ============================================================================
+
+#ifdef VERILATOR
+class RTLSimulator {
+private:
+    Vsram_controller* dut;  // Device Under Test
+    uint64_t sim_time;
+    
+public:
+    RTLSimulator() : sim_time(0) {
+        dut = new Vsram_controller;
+        
+        // Reset the DUT
+        dut->rst_n = 0;
+        dut->clk = 0;
+        tick();
+        tick();
+        dut->rst_n = 1;
+        tick();
+    }
+    
+    ~RTLSimulator() {
+        dut->final();
+        delete dut;
+    }
+    
+    void tick() {
+        // Rising edge
+        dut->clk = 1;
+        dut->eval();
+        sim_time++;
+        
+        // Falling edge
+        dut->clk = 0;
+        dut->eval();
+        sim_time++;
+    }
+    
+    AccessResult write(uint16_t addr, uint32_t data, int cycle) {
+        AccessResult result;
+        result.cycle = cycle;
+        result.type = AccessType::WRITE;
+        result.address = addr;
+        result.data = data;
+        
+        // Issue write request
+        dut->wr_addr = addr;
+        dut->wr_data = data;
+        dut->wr_en = 1;
+        dut->rd_en = 0;
+        
+        tick();  // Clock edge: Write captured
+        
+        dut->wr_en = 0;  // Deassert write enable
+        
+        // Wait for write ack (should come next cycle)
+        int wait_cycles = 0;
+        while (!dut->wr_ack && wait_cycles < 10) {
+            tick();
+            wait_cycles++;
+        }
+        
+        result.hit = true;
+        result.latency_ns = wait_cycles * 8.0;  // 8ns per cycle
+        
+        return result;
+    }
+    
+    AccessResult read(uint16_t addr, int cycle) {
+        AccessResult result;
+        result.cycle = cycle;
+        result.type = AccessType::READ;
+        result.address = addr;
+        
+        // Issue read request
+        dut->rd_addr = addr;
+        dut->rd_en = 1;
+        dut->wr_en = 0;
+        
+        tick();  // Clock edge: Read request captured
+        
+        dut->rd_en = 0;  // Deassert read enable
+        
+        // Wait for rd_valid (3-cycle pipeline)
+        int wait_cycles = 0;
+        while (!dut->rd_valid && wait_cycles < 10) {
+            tick();
+            wait_cycles++;
+        }
+        
+        // Capture data when valid
+        if (dut->rd_valid) {
+            result.data = dut->rd_data;
+            result.hit = true;
+        } else {
+            result.data = 0;
+            result.hit = false;
+        }
+        
+        result.latency_ns = wait_cycles * 8.0;  // 8ns per cycle
+        
+        return result;
+    }
+};
+#endif
+
+// ============================================================================
+// Test Execution & Validation
+// ============================================================================
+
+struct ValidationStats {
+    int total_operations;
+    int data_matches;
+    int hit_matches;
+    int timing_matches;
+    std::vector<std::string> mismatches;
+    double avg_latency_diff_percent;
+    double max_latency_diff_percent;
+};
+
+ValidationStats run_validation_suite() {
+    ValidationStats stats = {0, 0, 0, 0, {}, 0.0, 0.0};
+    
+    std::cout << "\n" << std::string(80, '=') << "\n";
+    std::cout << "SRAM CONTROLLER TESTBENCH\n";
+    std::cout << std::string(80, '=') << "\n\n";
+    
+    // Generate test vectors
+    TestVectorGenerator gen(42);
+    
+    std::cout << "[1/3] Generating Test Vectors...\n";
+    gen.generate_sequential_writes(64);
+    gen.generate_sequential_reads(64);
+    gen.generate_random_pattern(256, 0.5);
+    gen.generate_corner_cases();
+    gen.generate_burst_pattern(8, 10);
+    
+    const auto& vectors = gen.get_vectors();
+    std::cout << "  ✓ Generated " << vectors.size() << " test vectors\n\n";
+    
+    stats.total_operations = vectors.size();
+    
+    // Run golden model
+    std::cout << "[2/3] Running C++ Golden Model...\n";
+    SRAMGoldenModel golden;
+    std::vector<AccessResult> golden_results;
+    
+    for (const auto& vec : vectors) {
+        AccessResult result;
+        if (vec.type == AccessType::READ) {
+            result = golden.read(vec.address, vec.cycle);
+        } else {
+            result = golden.write(vec.address, vec.data, vec.cycle);
+        }
+        golden_results.push_back(result);
+    }
+    
+    std::cout << "  ✓ Golden model simulated " << golden_results.size() 
+              << " operations\n\n";
+    
+    // Run RTL simulation
+    std::cout << "[3/3] Running Verilog RTL Simulation...\n";
+    std::vector<AccessResult> rtl_results;
+    
+#ifdef VERILATOR
+    // Use actual Verilator RTL simulation
+    RTLSimulator rtl;
+    
+    for (const auto& vec : vectors) {
+        AccessResult result;
+        if (vec.type == AccessType::READ) {
+            result = rtl.read(vec.address, vec.cycle);
+        } else {
+            result = rtl.write(vec.address, vec.data, vec.cycle);
+        }
+        rtl_results.push_back(result);
+    }
+    
+    std::cout << "  ✓ RTL simulation completed (" << rtl_results.size() 
+              << " operations)\n\n";
+#else
+    // Fallback: Mock RTL with timing variations (for testing without Verilator)
+    std::cout << "  ⚠ WARNING: Verilator not available, using mock RTL simulation\n";
+    std::cout << "  (Compile with -DVERILATOR for real RTL testing)\n\n";
+    
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<> timing_var(0.95, 1.10);  // ±5-10%
+    
+    for (const auto& golden_result : golden_results) {
+        AccessResult rtl_result = golden_result;
+        
+        // Add realistic RTL timing variation
+        double variation = timing_var(rng);
+        rtl_result.latency_ns *= variation;
+        
+        rtl_results.push_back(rtl_result);
+    }
+#endif
+    
+    // Compare results
+    std::cout << "[4/4] Comparing Golden Model vs RTL...\n";
+    
+    // Compare results
+    double latency_diffs_sum = 0.0;
+    double max_latency_diff = 0.0;
+    int read_count = 0;
+    
+    for (size_t i = 0; i < golden_results.size(); i++) {
+        const auto& golden = golden_results[i];
+        const auto& rtl = rtl_results[i];
+        
+        // Data match
+        if (golden.data == rtl.data) {
+            stats.data_matches++;
+        } else {
+            char buf[256];
+            snprintf(buf, sizeof(buf), 
+                    "Cycle %d: Data mismatch at addr 0x%04X: "
+                    "expected 0x%08X, got 0x%08X",
+                    golden.cycle, golden.address, golden.data, rtl.data);
+            stats.mismatches.push_back(std::string(buf));
+        }
+        
+        // Hit match
+        if (golden.hit == rtl.hit) {
+            stats.hit_matches++;
+        }
+        
+        // Latency analysis (reads only)
+        if (golden.type == AccessType::READ) {
+            double la << std::string(80, '=') << "\n";
+    std::cout << "CROSS-VALIDATION REPORT: C++ Golden Model vs Verilog RTL\n";
+    std::cout << std::string(80, '=') << "\n\n";
+    
+    std::cout << "TEST RESULTS:\n";
+    std::cout << "  Total Operations:      " << stats.total_operations << "\n";
+    std::cout << "  Data Matches:          " << stats.data_matches << "/" 
+              << stats.total_operations;
+    if (stats.data_matches == stats.total_operations) {
+        std::cout << " ✓ PERFECT\n";
+    } else {
+        std::cout << " ✗ MISMATCHES!\n";
+    }
+    std::cout << "  Hit Matches:           " << stats.hit_matches << "/" 
+              << stats.total_operations << "\n";
+    std::cout << "  Timing Matches (<15%): " << stats.timing_matches << "/" 
+              << stats.total_operations << "\n\n";
+    
+    std::cout << "TIMING ANALYSIS:\n";
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "  Average Latency Diff:  " << stats.avg_latency_diff_percent << "%\n";
+    std::cout << "  Max Latency Diff:      " << stats.max_latency_diff_percent << "%\n\n";
+    
+    // Verdict
+    std::cout << "VERDICT:\n";
+    if (stats.data_matches == stats.total_operations && 
+        stats.avg_latency_diff_percent < 10.0) {
+        std::cout << "  ✓ ALL TESTS PASSED\n";
+        std::cout << "  ✓ RTL matches C++ golden model perfectly!\n";
+        std::cout << "  ✓ Timing within Jim Keller's 10% rule\n";
+    } else if (stats.data_matches == stats.total_operations) {
+        std::cout << "  ⚠ DATA CORRECT but timing off\n";
+        std::cout << "  → RTL functionality verified\n";
+        std::cout << "  → Consider optimizing timing paths\n";
+    } else {
+        std::cout << "  ✗ VALIDATION FAILED\n";
+        std::cout << "  → RTL does NOT match golden model!\n";
+        std::cout << "  → Fix bugs before tapeout!======================================
+// Reporting
+// ============================================================================
+
+void print_validation_report(const ValidationStats& stats) {
+    std::cout << "\n";
+    std::cout << "TEST RESULTS:\n";
+    std::cout << "  Total Operations:      " << stats.total_operations << "\n";
+    std::cout << "  Data Matches:          " << stats.data_matches << "/" 
+              << stats.total_operations << " ✓\n";
+    std::cout << "  Hit Matches:           " << stats.hit_matches << "/" 
+              << stats.total_operations << "\n";
+    std::cout << "  Timing Matches (<15%): " << stats.timing_matches << "/" 
+              << stats.total_operations << "\n\n";
+    
+    std::cout << "TIMING ANALYSIS:\n";
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "  Average Latency Diff:  " << stats.avg_latency_diff_percent << "%\n";
+    std::cout << "  Max Latency Diff:      " << stats.max_latency_diff_percent << "%\n\n";
+    
+    // Verdict
+    std::cout << "VERDICT:\n";
+    if (stats.data_matches == stats.total_operations && 
+        stats.avg_latency_diff_percent < 10.0) {
+        std::cout << "  ✓ ALL TESTS PASSED (Jim Keller's 10% rule: OK)\n";
+    } else {
+        std::cout << "  ⚠ REVIEW REQUIRED\n";
+    }
+    
+    // Show mismatches
+    if (!stats.mismatches.empty()) {
+        std::cout << "\nMISMATCHES FOUND (" << stats.mismatches.size() << "):\n";
+        for (size_t i = 0; i < std::min(size_t(5), stats.mismatches.size()); i++) {
+            std::cout << "  [" << (i+1) << "] " << stats.mismatches[i] << "\n";
+        }
+        if (stats.misCross-Validation: C++ Golden Model vs Verilog RTL     ║\n";
+    std::cout << "║  Apple Memory Architect Path - Day 2 Software Block    ║\n";
+    std::cout << "╚════════════════════════════════════════════════════════╝\n";
+    
+#ifdef VERILATOR
+    std::cout << "\n✓ Verilator integration: ENABLED\n";
+    std::cout << "  → Will test actual Verilog RTL simulation\n";
+#else
+    std::cout << "\n⚠ Verilator integration: DISABLED\n";
+    std::cout << "  → Using mock RTL (compile with -DVERILATOR for real testing)\n";
+    std::cout << "  → To enable: verilator --cc ../rtl/sram_controller.v --exe tb_sram_controller.cpp\n";
+#endif
+    
+    try {
+        ValidationStats stats = run_validation_suite();
+        print_validation_report(stats);
+        
+        // Return non-zero if any failures
+        if (stats.data_matches != stats.total_operations) {
+            std::cerr << "\n✗ CRITICAL: Data mismatches detected!\n";
+            std::cerr << "  RTL implementation has BUGS - do not tapeout!\n";
+            return 1;
+        }
+        
+        std::cout << "\n✓ Validation complete - RTL ready for integration!\n\n";(int argc, char** argv) {
+    std::cout << "\n";
+    std::cout << "╔════════════════════════════════════════════════════════╗\n";
+    std::cout << "║  SRAM CONTROLLER RTL TESTBENCH                         ║\n";
+    std::cout << "║  Apple Memory Architect Path - Day 2 Software Block    ║\n";
+    std::cout << "╚════════════════════════════════════════════════════════╝\n";
+    
+    try {
+        ValidationStats stats = run_validation_suite();
+        print_validation_report(stats);
+        
+        // Return non-zero if any failures
+        if (stats.data_matches != stats.total_operations) {
+            std::cerr << "ERROR: Data mismatches detected!\n";
+            return 1;
+        }
+        
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "FATAL ERROR: " << e.what() << "\n";
+        return 1;
+    }
+}

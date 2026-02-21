@@ -8,7 +8,7 @@
  * - Retention profiling (RAIDR algorithm)
  * - Power optimization through clustering
  * 
- * References:
+ * References:na
  * - JEDEC JESD79-4C DDR4 Specification
  * - Liu et al., "RAIDR: Retention-Aware Intelligent DRAM Refresh", ISCA 2012
  * - Micron Technical Note TN-40-46
@@ -65,18 +65,12 @@ RefreshController::RefreshController(const DRAMTiming& timing,
     double cycle_time_ns = 1000.0 / 1600.0;  // ~0.625ns
     base_trefi_ = static_cast<uint64_t>(BASE_TREFI_NS / cycle_time_ns);
     current_trefi_ = base_trefi_;
-    
-    // Set refresh command time based on mode
     current_trfc_ = static_cast<uint64_t>(TRFC_ALL_BANK_NS / cycle_time_ns);
-    
-    // Maximum postponement = 8x tREFI
     max_postponement_ = base_trefi_ * MAX_POSTPONEMENT_FACTOR;
-    
-    // Clustering window = 10% of tREFI
     cluster_window_ = base_trefi_ / 10;
     
-    // Initialize per-bank state
-    bank_states_.resize(num_banks);
+    // fix vector init and typos
+    bank_states_.resize(num_banks_);
     for (auto& state : bank_states_) {
         state.last_refresh_cycle = 0;
         state.next_refresh_cycle = base_trefi_;
@@ -85,17 +79,17 @@ RefreshController::RefreshController(const DRAMTiming& timing,
         state.postponement_count = 0;
     }
     
-    // Initialize retention profiles (if needed later)
-    retention_profiles_.resize(num_banks);
+    retention_profiles_.resize(num_banks_);
     for (auto& bank_profiles : retention_profiles_) {
-        bank_profiles.resize(rows_per_bank);
-        for (uint32_t row = 0; row < rows_per_bank; ++row) {
+        bank_profiles.resize(rows_per_bank_);
+        for (uint32_t row = 0; row < rows_per_bank_; ++row) {
             auto& profile = bank_profiles[row];
             profile.row_address = row;
-            profile.min_retention_time = base_trefi_ * 64; // 64ms typical
+            profile.measured_min_retention_cycles = UINT64_MAX; // Start at max, will be updated
+            profile.safe_retention_limit_cycles = base_trefi_ * MAX_POSTPONEMENT_FACTOR; // JEDEC 8x
             profile.last_refresh_cycle = 0;
+            profile.retention_bin = NUM_RETENTION_BINS / 2;
             profile.weak_cell_count = 0;
-            profile.retention_bin = NUM_RETENTION_BINS / 2; // Middle bin
             profile.requires_frequent_refresh = false;
         }
     }
@@ -113,7 +107,11 @@ bool RefreshController::is_refresh_needed(uint64_t current_cycle) const {
     
     // Check if any queued refreshes are overdue
     if (!refresh_queue_.empty()) {
-        return true;
+        const RefreshCommand& top = refresh_queue_.top();
+        // Only wake up if the highest-priority command is urgent or overdue
+        if (top.urgency_level >= 200 || top.is_overdue(current_cycle)) {
+            return true;
+        }
     }
     
     return false;
@@ -182,24 +180,26 @@ void RefreshController::complete_refresh(const RefreshCommand& cmd,
 }
 
 bool RefreshController::try_postpone_refresh(uint64_t current_cycle) {
-    // Find most urgent refresh candidate
+    // Find refresh candidates that are due soon (within 10% of deadline)
     uint32_t candidate_bank = num_banks_;
-    uint64_t min_slack = UINT64_MAX;
+    int64_t min_slack = INT64_MAX;
     
     for (uint32_t bank = 0; bank < num_banks_; ++bank) {
-        const auto& state = bank_states_[bank];
+        auto& state = bank_states_[bank];
         
         if (state.refresh_in_progress) {
             continue;
         }
         
-        if (current_cycle >= state.next_refresh_cycle) {
-            uint64_t cycles_overdue = current_cycle - state.next_refresh_cycle;
-            
+        // Calculate time until refresh is due
+        int64_t cycles_until_refresh = static_cast<int64_t>(state.next_refresh_cycle) - static_cast<int64_t>(current_cycle);
+        
+        // Consider postponing if refresh is coming up soon (within 10% of tREFI) or already due
+        if (cycles_until_refresh <= static_cast<int64_t>(current_trefi_ / 10)) {
             // Check if we can safely postpone
             if (can_safely_postpone(bank, current_cycle)) {
-                if (cycles_overdue < min_slack) {
-                    min_slack = cycles_overdue;
+                if (cycles_until_refresh < min_slack) {
+                    min_slack = cycles_until_refresh;
                     candidate_bank = bank;
                 }
             }
@@ -260,27 +260,28 @@ void RefreshController::set_refresh_mode(RefreshMode mode) {
 void RefreshController::update_temperature(double temp_celsius) {
     current_temperature_ = temp_celsius;
     
-    // Determine thermal range and adjust tREFI
+    // Calculate what new_range would be
     ThermalRange new_range;
-    
     if (temp_celsius <= TEMP_NORMAL_MAX) {
         new_range = ThermalRange::NORMAL;
-        current_trefi_ = base_trefi_;
     } else if (temp_celsius <= TEMP_EXTENDED_85C_MAX) {
-        new_range = ThermalRange::EXTENDED_85C;
-        current_trefi_ = base_trefi_ / 2; // 2x refresh rate
+        new_range = ThermalRange::EXTENDED;
     } else {
-        new_range = ThermalRange::EXTENDED_95C;
-        current_trefi_ = base_trefi_ / 4; // 4x refresh rate
+        new_range = ThermalRange::HIGH_TEMP;
     }
     
-    if (new_range != thermal_range_) {
-        thermal_range_ = new_range;
-        
-        // Update all bank next refresh times
-        for (auto& state : bank_states_) {
-            state.next_refresh_cycle = state.last_refresh_cycle + current_trefi_;
-        }
+    // Early exit if no change needed
+    if (new_range == thermal_range_) {
+        return;  // No work needed!
+    }
+    
+    // Range changed - now update tREFI and banks
+    thermal_range_ = new_range;
+    current_trefi_ = calculate_trefi(temp_celsius);  // Use the helper function
+    
+    // Update all bank next refresh times
+    for (auto& state : bank_states_) {
+        state.next_refresh_cycle = state.last_refresh_cycle + current_trefi_;
     }
 }
 
@@ -302,8 +303,14 @@ void RefreshController::update_row_profile(uint32_t bank, uint32_t row,
     
     auto& profile = retention_profiles_[bank][row];
     
-    // Update minimum retention time
-    profile.min_retention_time = std::min(profile.min_retention_time, retention_time);
+    // Update minimum retention time (use min for first update, then track minimum)
+    if (profile.measured_min_retention_cycles == UINT64_MAX) {
+        // First measurement - just set it
+        profile.measured_min_retention_cycles = retention_time;
+    } else {
+        // Subsequent measurements - track minimum
+        profile.measured_min_retention_cycles = std::min(profile.measured_min_retention_cycles, retention_time);
+    }
     
     // Categorize into retention bin
     uint64_t bin_threshold = base_trefi_ * 64 / NUM_RETENTION_BINS;
@@ -312,32 +319,14 @@ void RefreshController::update_row_profile(uint32_t bank, uint32_t row,
                 static_cast<uint64_t>(NUM_RETENTION_BINS - 1))
     );
     
-    // Mark if requires frequent refresh (below 2x normal)
-    profile.requires_frequent_refresh = (retention_time < base_trefi_ * 2);
+    // Mark if requires frequent refresh (RAIDR: bottom 10% of retention distribution)
+    // Use 0.5x tREFI as threshold for weak rows (significantly below normal)
+    profile.requires_frequent_refresh = (retention_time < base_trefi_ / 2);
     
     // Count weak cells (simplified model)
     if (profile.requires_frequent_refresh) {
         profile.weak_cell_count++;
     }
-}
-
-void RefreshController::get_retention_stats(uint32_t& weak_rows,
-                                           uint64_t& avg_retention) const {
-    weak_rows = 0;
-    uint64_t total_retention = 0;
-    uint64_t total_rows = 0;
-    
-    for (const auto& bank_profiles : retention_profiles_) {
-        for (const auto& profile : bank_profiles) {
-            if (profile.requires_frequent_refresh) {
-                weak_rows++;
-            }
-            total_retention += profile.min_retention_time;
-            total_rows++;
-        }
-    }
-    
-    avg_retention = total_rows > 0 ? total_retention / total_rows : 0;
 }
 
 // ========== Power Optimization ==========
@@ -476,18 +465,68 @@ bool RefreshController::can_safely_postpone(uint32_t bank, uint64_t current_cycl
     
     // Check retention profiles if enabled
     if (retention_profiling_enabled_) {
-        // Cannot postpone if bank has weak retention rows
+        // RAIDR Key Insight: Only check the WEAKEST rows in this bank
+        // Strong rows (90%+) can safely wait longer
+        
+        uint64_t min_retention_in_bank = UINT64_MAX;
+        bool has_initialized_rows = false;
+        
         for (const auto& profile : retention_profiles_[bank]) {
-            if (profile.requires_frequent_refresh) {
-                uint64_t time_since_refresh = current_cycle - profile.last_refresh_cycle;
-                if (time_since_refresh > profile.min_retention_time / 2) {
-                    return false; // Too risky
-                }
+            if (profile.measured_min_retention_cycles != UINT64_MAX) {
+                min_retention_in_bank = std::min(min_retention_in_bank, 
+                                                 profile.measured_min_retention_cycles);
+                has_initialized_rows = true;
+            }
+        }
+        
+        // If we have retention data, check the weakest row
+        if (has_initialized_rows) {
+            uint64_t time_since_last_refresh = current_cycle - state.last_refresh_cycle;
+            uint64_t postponement_time = current_trefi_ / 4;
+            uint64_t safety_threshold = min_retention_in_bank * 9 / 10;
+            
+            // Can we safely wait another quarter-interval?
+            // Conservative: don't exceed 90% of weakest row's retention time
+            if (time_since_last_refresh + postponement_time > safety_threshold) {
+                return false; // Too risky - weakest row approaching limit
             }
         }
     }
     
     return true;
+}
+
+RetentionStats RefreshController::get_retention_stats() const {
+    RetentionStats stats{0, 0};
+    uint64_t total_retention = 0;
+    uint32_t total_rows = 0;
+    
+    // Iterate through all banks and rows
+    for (const auto& bank_profiles : retention_profiles_) {
+        for (const auto& profile : bank_profiles) {
+            uint64_t retention = profile.measured_min_retention_cycles;
+            
+            // Skip uninitialized rows
+            if (retention == UINT64_MAX) {
+                continue;
+            }
+            
+            // Count weak rows (retention < half of base tREFI)
+            // base_trefi_ is ~12,480 cycles, so threshold is ~6,240
+            // Weak rows should have retention < 6,240 (from /3 operation: 5,000-25,000 / 3 = 1,667-8,333)
+            if (retention < base_trefi_ / 2) {
+                stats.weak_rows++;
+            }
+            
+            total_retention += retention;
+            total_rows++;
+        }
+    }
+    
+    // Calculate average
+    stats.avg_retention = total_rows > 0 ? total_retention / total_rows : 0;
+    
+    return stats;
 }
 
 } // namespace dram

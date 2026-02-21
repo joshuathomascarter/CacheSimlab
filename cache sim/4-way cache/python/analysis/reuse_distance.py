@@ -36,8 +36,8 @@ def compute_reuse_distance(trace: List[int], block_size: int = 64) -> List[int]:
     """
     Compute the reuse distance (stack distance) for each access.
     
-    Reuse distance = number of unique addresses accessed since last access
-    to the same address. First access to any address has distance = -1 (infinity).
+    Reuse distance = number of UNIQUE blocks accessed between two consecutive
+    accesses to the same block. First access to any block has distance = -1 (infinity).
     
     Args:
         trace: List of memory addresses
@@ -47,70 +47,33 @@ def compute_reuse_distance(trace: List[int], block_size: int = 64) -> List[int]:
         List of reuse distances (-1 for first access, >= 0 otherwise)
     
     Algorithm:
-        Uses an LRU stack. On each access:
-        1. If address in stack, distance = position in stack
-        2. Move address to top of stack
-        3. If first access, distance = -1
+        Track last access index for each block. For each new access:
+        1. If block seen before: count unique blocks between last access and now
+        2. If first access: distance = -1 (compulsory miss)
     """
-    # Convert to block addresses
+    # Convert to block addresses (multiple addresses per block map to same block_id)
     block_trace = [addr // block_size for addr in trace]
     
-    # LRU stack using OrderedDict for O(1) operations
-    # Key = block address, Value = position (maintained implicitly by order)
-    lru_stack = OrderedDict()
-    distances = []
-    
-    for block in block_trace:
-        if block in lru_stack:
-            # Calculate distance (position in stack from top)
-            # Stack is ordered: newest first, oldest last
-            keys = list(lru_stack.keys())
-            distance = len(keys) - 1 - keys.index(block)
-            
-            # Move to front (delete and re-add)
-            del lru_stack[block]
-            lru_stack[block] = True
-            
-            # Actually, we want distance from top, so:
-            # distance = how many unique items since last access
-            distance = len(keys) - 1 - keys[::-1].index(block)
-            distances.append(distance)
-        else:
-            # First access
-            distances.append(-1)
-            lru_stack[block] = True
-    
-    return distances
-
-
-def compute_reuse_distance_fast(trace: List[int], block_size: int = 64) -> List[int]:
-    """
-    Faster implementation using last-access tracking.
-    
-    Instead of maintaining a full LRU stack, we track:
-    - Last access index for each block
-    - Count unique blocks between current and last access
-    
-    Note: This is O(n²) worst case but often faster for sparse traces.
-    For true O(n log n), use Olken's algorithm with a balanced tree.
-    """
-    block_trace = [addr // block_size for addr in trace]
-    
-    last_access = {}  # block -> last index accessed
+    last_access = {}  # Maps block_id -> index of last access in trace
     distances = []
     
     for i, block in enumerate(block_trace):
         if block in last_access:
-            last_idx = last_access[block]
-            # Count unique blocks between last_idx+1 and i-1
-            between = set(block_trace[last_idx + 1:i])
-            distances.append(len(between))
+            # Count unique blocks between last access to this block and now
+            distance = len(seen_since_last)
         else:
-            distances.append(-1)  # First access (infinite distance)
+            distance = -1  # First access (compulsory miss)
         
+        distances.append(distance)
+
+        # Update tracking: this block becomes the reference point
+        # Clear the "seen since last access to this block" and add current block
+        seen_since_last = set()
         last_access[block] = i
-    
+        seen_since_last.add(block)
+
     return distances
+        
 
 
 def compute_reuse_histogram(distances: List[int], 
@@ -335,3 +298,19 @@ if __name__ == "__main__":
     
     print("\nGenerating plots...")
     plot_reuse_histogram(distances, output_file="reuse_distance_analysis.png")
+
+
+def test_reuse_distance_bug():
+    """Test that reuse distance counts UNIQUE blocks, not total accesses"""
+    # Block trace: [A, B, A, C, A]
+    trace = [0, 64, 0, 128, 0]  # addresses that map to blocks 0, 1, 0, 2, 0
+    distances = compute_reuse_distance(trace, block_size=64)
+    
+    # Expected: [-1, -1, 1, -1, 1]
+    # (A first, B first, A with 1 unique block between (B), C first, A with 1 unique between (C))
+    assert distances == [-1, -1, 1, -1, 1], f"Got {distances}"
+    print("✅ Reuse distance bug test passed!")
+
+
+if __name__ == "__main__":
+    test_reuse_distance_bug()

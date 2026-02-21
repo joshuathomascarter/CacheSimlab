@@ -1,0 +1,15 @@
+{
+  "summary": {
+    "total_vectors": 1258,
+    "data_match_rate": 1.0,
+    "timing_match_rate": 0.4912559618441971,
+    "correlation": 1.0
+  },
+  "timing": {
+    "cpp_avg_read_ns": 2.5,
+    "rtl_avg_read_ns": 2.5729408115886763,
+    "avg_variance_percent": 3.3281748572053926,
+    "max_variance_percent": 7.986288435101514
+  },
+  "mismatches": []
+}

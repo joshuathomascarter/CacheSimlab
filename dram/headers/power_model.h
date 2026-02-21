@@ -313,6 +313,17 @@ public:
      */
     double get_validation_error() const;
     
+    /**
+     * @brief Cross-validate with DRAMPower-style calculations
+     * 
+     * Compares energy calculations against DRAMPower reference formulas.
+     * Exports trace for external DRAMPower validation.
+     * 
+     * @param energy_diff_percent Output: energy difference percentage
+     * @return true if within tolerance (±5%)
+     */
+    bool cross_validate_with_drampower(double& energy_diff_percent) const;
+    
     // ========== Statistics ==========
     
     /**
